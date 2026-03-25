@@ -346,12 +346,21 @@ class DaumCrawlerInstance(ctk.CTkFrame):
     def import_existing_db(self):
         if self.is_running:
             return
-        file_path = filedialog.askopenfilename(title="기존 추출 DB 엑셀 선택", filetypes=[("Excel Files", "*.xlsx;*.xls")])
-        if not file_path:
+        file_paths = filedialog.askopenfilenames(title="기존 추출 DB 엑셀 선택(다중 선택 가능)", filetypes=[("Excel Files", "*.xlsx;*.xls")])
+        if not file_paths:
             return
         try:
-            merged = self.history_manager.merge_from_excel(file_path)
-            self.status_label.configure(text=f"📂 기존 DB 병합 완료 (이메일 +{merged['emails']}, 도메인 +{merged['domains']})")
+            total_emails = 0
+            total_domains = 0
+            success_count = 0
+            for path in file_paths:
+                merged = self.history_manager.merge_from_excel(path)
+                total_emails += merged["emails"]
+                total_domains += merged["domains"]
+                success_count += 1
+            self.status_label.configure(
+                text=f"📂 기존 DB {success_count}개 병합 완료 (이메일 +{total_emails}, 도메인 +{total_domains})"
+            )
         except Exception as e:
             messagebox.showerror("오류", f"기존 DB 병합 실패: {e}")
 
@@ -546,7 +555,7 @@ class DaumTabUI(ctk.CTkFrame):
         self.inner_tabview = ctk.CTkTabview(self)
         self.inner_tabview.pack(fill="both", expand=True, padx=5, pady=0)
         
-        for i in range(1, 6):
+        for i in range(1, 3):
             tab_name = f"추출 {i}"
             tab = self.inner_tabview.add(tab_name)
             
