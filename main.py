@@ -23,7 +23,7 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
-CURRENT_VERSION = "1.0"
+CURRENT_VERSION = "1.1"
 AUTH_FILE = "auth_config.json"
 UPDATE_DIR = "updates"
 
@@ -32,6 +32,7 @@ class IntegratedExtractorApp(ctk.CTk):
         super().__init__()
         self.user_info = user_info
         self.blocklist = BlockList()
+        self.run_semaphore = threading.BoundedSemaphore(2)
         
         self.user_plan = str(user_info.get('Plan', '무료')).strip()
         self.user_name = str(user_info.get('Name', '')).strip()
@@ -56,8 +57,8 @@ class IntegratedExtractorApp(ctk.CTk):
         tab_daum = self.tabview.add("🔍 포털(Daum)")
         tab_jobkorea = self.tabview.add("🏢 잡코리아")
         
-        DaumTabUI(tab_daum, plan=self.user_plan, blocklist=self.blocklist).pack(fill="both", expand=True)
-        JobKoreaTabUI(tab_jobkorea, plan=self.user_plan, blocklist=self.blocklist).pack(fill="both", expand=True)
+        DaumTabUI(tab_daum, plan=self.user_plan, blocklist=self.blocklist, run_semaphore=self.run_semaphore).pack(fill="both", expand=True)
+        JobKoreaTabUI(tab_jobkorea, plan=self.user_plan, blocklist=self.blocklist, run_semaphore=self.run_semaphore).pack(fill="both", expand=True)
         self.after(800, self.check_update_in_background)
 
     def check_update_in_background(self):

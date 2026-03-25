@@ -21,7 +21,6 @@ from datetime import datetime
 import os
 
 email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
-phone_pattern = r'(?:02|0[3-9][0-9]|010|15[0-9]{2}|16[0-9]{2}|18[0-9]{2})-?\d{3,4}-?\d{4}'
 
 def extract_valid_emails(text):
     if not text: return set()
@@ -34,9 +33,11 @@ def extract_valid_emails(text):
                 valid_emails.add(e)
     return valid_emails
 
-def extract_valid_phones(text):
-    if not text: return set()
-    return set(re.findall(phone_pattern, text))
+def _interruptible_sleep(stop_event: threading.Event, seconds: float):
+    if stop_event is None:
+        time.sleep(seconds)
+        return False
+    return stop_event.wait(timeout=seconds)
 
 def get_chrome_driver():
     options = Options()
@@ -52,26 +53,33 @@ def get_chrome_driver():
     service = Service(ChromeDriverManager().install())
     return webdriver.Chrome(service=service, options=options)
 
-def run_daum_crawler(search_keyword, max_pages, ext_email, ext_phone, limit, log_cb, check_running_cb, data_cb,
-                     blocklist: BlockList = None, history_manager: LocalHistoryManager = None):
+def run_daum_crawler(search_keyword, max_pages, ext_email, limit, log_cb, check_running_cb, data_cb,
+                     blocklist: BlockList = None, history_manager: LocalHistoryManager = None,
+                     stop_event: threading.Event = None, run_semaphore: threading.BoundedSemaphore = None):
     driver = None
     blocklist = blocklist or BlockList()
     history_manager = history_manager or LocalHistoryManager()
-    try: driver = get_chrome_driver()
-    except Exception as e:
-        log_cb(f"브라우저 오류: {e}"); log_cb("FINISH_SIGNAL")
-        return
-
-    collected_sites = []
-    extracted_count = 0 
-
+    acquired = False
     try:
+        if run_semaphore is not None:
+            run_semaphore.acquire()
+            acquired = True
+        try:
+            driver = get_chrome_driver()
+        except Exception as e:
+            log_cb(f"브라우저 오류: {e}"); log_cb("FINISH_SIGNAL")
+            return
+
+        collected_sites = []
+        extracted_count = 0 
+
         log_cb(f"🚀 Daum 백그라운드 탐색 시작...")
         for page_num in range(1, max_pages + 1):
             if not check_running_cb(): break
             url = f"https://search.daum.net/search?w=site&q={search_keyword}&p={page_num}"
             driver.get(url)
-            time.sleep(random.uniform(1.5, 2.5))
+            if _interruptible_sleep(stop_event, random.uniform(1.5, 2.5)):
+                break
             
             try:
                 main_area = WebDriverWait(driver, 5).until(EC.presence_of_element_located((By.CSS_SELECTOR, "#mArticle, .c-main, #dnsColl")))
@@ -119,15 +127,15 @@ def run_daum_crawler(search_keyword, max_pages, ext_email, ext_phone, limit, log
             try:
                 driver.set_page_load_timeout(10)
                 driver.get(url)
-                time.sleep(random.uniform(2, 4))
+                if _interruptible_sleep(stop_event, random.uniform(2, 4)):
+                    break
                 
-                valid_emails, valid_phones = set(), set()
+                valid_emails = set()
                 page_text = driver.find_element(By.TAG_NAME, "body").text
                 
                 if ext_email: valid_emails.update(extract_valid_emails(page_text))
-                if ext_phone: valid_phones.update(extract_valid_phones(page_text))
                 
-                if (ext_email and not valid_emails) or (ext_phone and not valid_phones):
+                if ext_email and not valid_emails:
                     target_links = []
                     for a in driver.find_elements(By.TAG_NAME, "a"):
                         try:
@@ -137,17 +145,17 @@ def run_daum_crawler(search_keyword, max_pages, ext_email, ext_phone, limit, log
                     
                     for link in list(set(target_links))[:3]:
                         try:
-                            driver.get(link); time.sleep(2)
+                            driver.get(link)
+                            if _interruptible_sleep(stop_event, 2):
+                                break
                             sub_page_text = driver.find_element(By.TAG_NAME, "body").text
                             if ext_email: valid_emails.update(extract_valid_emails(sub_page_text))
-                            if ext_phone: valid_phones.update(extract_valid_phones(sub_page_text))
-                            if (not ext_email or valid_emails) and (not ext_phone or valid_phones): break
+                            if (not ext_email or valid_emails): break
                         except: continue
 
                 email_str = ", ".join(list(valid_emails)) if valid_emails else ""
-                phone_str = ", ".join(list(valid_phones)) if valid_phones else ""
 
-                if email_str or phone_str:
+                if email_str:
                     domain = ""
                     try:
                         domain = url.split("//", 1)[-1].split("/", 1)[0].replace("www.", "").lower().strip()
@@ -167,46 +175,39 @@ def run_daum_crawler(search_keyword, max_pages, ext_email, ext_phone, limit, log
                                 log_cb(f"🟡 이메일 중복 이력으로 스킵: {one_email}")
                                 continue
                             extracted_count += 1
-                            data_cb({"업체명": company, "업종": ind, "전화번호": phone_str, "이메일": one_email})
+                            data_cb({"업체명": company, "업종": ind, "이메일": one_email})
                             history_manager.add_email(one_email)
                             if domain and not domain_added:
                                 history_manager.add_domain(domain)
                                 domain_added = True
-                    elif phone_str:
-                        if blocklist.should_block(company, url, ""):
-                            log_cb(f"⛔ 금지목록 매칭으로 스킵: '{company}'")
-                            continue
-                        if domain and history_manager.is_domain_duplicate(domain):
-                            log_cb(f"🟡 도메인 중복 이력으로 스킵: '{company}'")
-                            continue
-                        if extracted_count < limit:
-                            extracted_count += 1
-                            data_cb({"업체명": company, "업종": ind, "전화번호": phone_str, "이메일": ""})
-                            if domain:
-                                history_manager.add_domain(domain)
             except Exception: pass
 
     finally:
         if driver: driver.quit()
+        if acquired and run_semaphore is not None:
+            try:
+                run_semaphore.release()
+            except Exception:
+                pass
         log_cb("FINISH_SIGNAL")
 
 class DaumCrawlerInstance(ctk.CTkFrame):
-    def __init__(self, master, tab_name, daily_limit, blocklist: BlockList):
+    def __init__(self, master, tab_name, daily_limit, blocklist: BlockList, run_semaphore: threading.BoundedSemaphore = None):
         super().__init__(master, fg_color="transparent")
         self.tab_name = tab_name
         self.daily_limit = daily_limit 
         self.data_list = []
         self.is_running = False
         self.blocklist = blocklist
+        self.run_semaphore = run_semaphore
         self.history_manager = LocalHistoryManager()
         self.keyword_queue = []
         self.reserved_keywords = []
         self.current_keyword = ""
         self.queue_total_collected = 0
-        self.all_results_by_keyword = {}
         self.max_pages = 100
         self.ext_email = True
-        self.ext_phone = True
+        self.stop_event = threading.Event()
         self.save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "autosave")
         self.setup_ui()
 
@@ -236,10 +237,7 @@ class DaumCrawlerInstance(ctk.CTkFrame):
         opt_frame = ctk.CTkFrame(self, fg_color="transparent")
         opt_frame.pack(fill="x", padx=15, pady=0)
         ctk.CTkLabel(opt_frame, text="✅ 옵션:", font=("Arial", 12, "bold"), text_color="#FFC107").pack(side="left", padx=(0, 10))
-        
-        self.chk_phone_var = tk.BooleanVar(value=True)
         self.chk_email_var = tk.BooleanVar(value=True)
-        ctk.CTkCheckBox(opt_frame, text="☎️ 전화번호", variable=self.chk_phone_var).pack(side="left", padx=10)
         ctk.CTkCheckBox(opt_frame, text="📧 이메일", variable=self.chk_email_var).pack(side="left", padx=10)
 
         block_frame = ctk.CTkFrame(self)
@@ -278,18 +276,16 @@ class DaumCrawlerInstance(ctk.CTkFrame):
         style.configure("Treeview.Heading", background="#1f538d", foreground="white", font=("Arial", 10, "bold"))
         style.map("Treeview", background=[('selected', '#14375e')])
 
-        columns = ("no", "company", "industry", "phone", "email")
+        columns = ("no", "company", "industry", "email")
         self.tree = ttk.Treeview(table_frame, columns=columns, show="headings")
         self.tree.heading("no", text="No")
         self.tree.heading("company", text="업체명")
         self.tree.heading("industry", text="업종")
-        self.tree.heading("phone", text="전화번호")
         self.tree.heading("email", text="이메일")
         self.tree.column("no", width=40, anchor="center")
         self.tree.column("company", width=150, anchor="w")
         self.tree.column("industry", width=100, anchor="center")
-        self.tree.column("phone", width=120, anchor="center")
-        self.tree.column("email", width=180, anchor="w")
+        self.tree.column("email", width=260, anchor="w")
 
         scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscroll=scrollbar.set)
@@ -387,7 +383,6 @@ class DaumCrawlerInstance(ctk.CTkFrame):
     def reset_crawling(self):
         if self.is_running: return
         self.data_list.clear()
-        self.all_results_by_keyword.clear()
         for item in self.tree.get_children(): self.tree.delete(item)
         self.status_label.configure(text="🧹 테이블이 초기화되었습니다.")
         self.btn_save.configure(state="disabled")
@@ -395,6 +390,7 @@ class DaumCrawlerInstance(ctk.CTkFrame):
     def stop_crawling(self):
         if self.is_running:
             self.is_running = False
+            self.stop_event.set()
             self.status_label.configure(text="🛑 수집 중단 요청됨 (작업 정리 중...)")
 
     def start_crawling(self):
@@ -402,10 +398,9 @@ class DaumCrawlerInstance(ctk.CTkFrame):
         keyword_raw = self.entry_keyword.get().strip()
         pages_input = self.entry_page.get().strip()
         ext_email = self.chk_email_var.get()
-        ext_phone = self.chk_phone_var.get()
 
-        if not ext_email and not ext_phone:
-            messagebox.showwarning("입력 오류", "전화번호 또는 이메일 중 최소 1개는 체크해 주세요.")
+        if not ext_email:
+            messagebox.showwarning("입력 오류", "이메일 추출 옵션을 체크해 주세요.")
             return
             
         if pages_input == "전체": max_pages = 100
@@ -424,12 +419,11 @@ class DaumCrawlerInstance(ctk.CTkFrame):
             return
 
         self.is_running = True
+        self.stop_event = threading.Event()
         self.keyword_queue = keywords
         self.queue_total_collected = 0
-        self.all_results_by_keyword = {}
         self.max_pages = max_pages
         self.ext_email = ext_email
-        self.ext_phone = ext_phone
         self.data_list.clear()
         for item in self.tree.get_children(): self.tree.delete(item)
         self.btn_start.configure(state="disabled", text="수집 중...")
@@ -458,7 +452,6 @@ class DaumCrawlerInstance(ctk.CTkFrame):
             return
 
         self.current_keyword = self.keyword_queue.pop(0)
-        self.all_results_by_keyword.setdefault(self.current_keyword, [])
         self.entry_keyword.delete(0, "end")
         self.entry_keyword.insert(0, self.current_keyword)
         self.data_list.clear()
@@ -476,18 +469,17 @@ class DaumCrawlerInstance(ctk.CTkFrame):
 
         def data_cb(row_dict):
             self.data_list.append(row_dict)
-            self.all_results_by_keyword.setdefault(self.current_keyword, []).append(row_dict)
             self.queue_total_collected += 1
             idx = len(self.data_list)
-            tree_values = (idx, row_dict.get("업체명", ""), row_dict.get("업종", ""), row_dict.get("전화번호", ""), row_dict.get("이메일", ""))
+            tree_values = (idx, row_dict.get("업체명", ""), row_dict.get("업종", ""), row_dict.get("이메일", ""))
             self.after(0, lambda: self.tree.insert("", "end", values=tree_values))
             self.after(0, lambda: self.tree.yview_moveto(1)) 
 
         remaining_limit = self.daily_limit - self.queue_total_collected if self.daily_limit != 999999 else 999999
         threading.Thread(
             target=run_daum_crawler,
-            args=(self.current_keyword, self.max_pages, self.ext_email, self.ext_phone, remaining_limit, log_cb, lambda: self.is_running, data_cb,
-                  self.blocklist, self.history_manager),
+            args=(self.current_keyword, self.max_pages, self.ext_email, remaining_limit, log_cb, lambda: self.is_running, data_cb,
+                  self.blocklist, self.history_manager, self.stop_event, self.run_semaphore),
             daemon=True
         ).start()
 
@@ -519,37 +511,11 @@ class DaumCrawlerInstance(ctk.CTkFrame):
             return None
         try:
             file_path = self._build_keyword_result_path(keyword)
-            pd.DataFrame(self.data_list)[["업체명", "업종", "전화번호", "이메일"]].to_excel(file_path, index=False)
+            pd.DataFrame(self.data_list)[["업체명", "업종", "이메일"]].to_excel(file_path, index=False)
             self.status_label.configure(text=f"💾 자동 저장 완료: {os.path.basename(file_path)}")
             return file_path
         except Exception as e:
             messagebox.showerror("오류", f"자동 저장 실패: {e}")
-            return None
-
-    def _safe_sheet_name(self, raw_name: str):
-        name = (raw_name or "Sheet").strip()
-        invalid = ['\\', '/', '*', '?', ':', '[', ']']
-        for ch in invalid:
-            name = name.replace(ch, "_")
-        if not name:
-            name = "Sheet"
-        return name[:31]
-
-    def save_all_results_auto(self):
-        if not self.all_results_by_keyword:
-            return None
-        try:
-            os.makedirs(self.save_dir, exist_ok=True)
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            file_path = os.path.join(self.save_dir, f"{ts}_Daum_{self.tab_name.replace(' ', '')}_ALL.xlsx")
-            with pd.ExcelWriter(file_path, engine="openpyxl") as writer:
-                for keyword, rows in self.all_results_by_keyword.items():
-                    if not rows:
-                        continue
-                    df = pd.DataFrame(rows)[["업체명", "업종", "전화번호", "이메일"]]
-                    df.to_excel(writer, sheet_name=self._safe_sheet_name(keyword), index=False)
-            return file_path
-        except Exception:
             return None
 
     def save_to_excel(self, auto=False, keyword_override=None):
@@ -564,17 +530,18 @@ class DaumCrawlerInstance(ctk.CTkFrame):
             file_path = filedialog.asksaveasfilename(title="엑셀 저장", initialfile=default_name, initialdir=self.save_dir, defaultextension=".xlsx", filetypes=[("Excel Files", "*.xlsx")])
         if file_path:
             try:
-                pd.DataFrame(self.data_list)[["업체명", "업종", "전화번호", "이메일"]].to_excel(file_path, index=False)
+                pd.DataFrame(self.data_list)[["업체명", "업종", "이메일"]].to_excel(file_path, index=False)
                 if not auto:
                     messagebox.showinfo("저장 완료", f"[{self.tab_name}] 총 {len(self.data_list)}건 저장 완료!")
             except Exception as e: messagebox.showerror("오류", f"저장 실패: {e}")
 
 # 🌟 중요: 반드시 파일 맨 아래 위치! 🌟
 class DaumTabUI(ctk.CTkFrame):
-    def __init__(self, master, plan="기간제", blocklist: BlockList = None):
+    def __init__(self, master, plan="기간제", blocklist: BlockList = None, run_semaphore: threading.BoundedSemaphore = None):
         super().__init__(master, fg_color="transparent")
         self.plan = plan
         self.blocklist = blocklist or BlockList()
+        self.run_semaphore = run_semaphore
         
         self.inner_tabview = ctk.CTkTabview(self)
         self.inner_tabview.pack(fill="both", expand=True, padx=5, pady=0)
@@ -588,5 +555,5 @@ class DaumTabUI(ctk.CTkFrame):
                 locked_label.pack(expand=True)
             else:
                 daily_limit = 50 if self.plan == "무료" else 999999
-                worker = DaumCrawlerInstance(tab, tab_name=tab_name, daily_limit=daily_limit, blocklist=self.blocklist)
+                worker = DaumCrawlerInstance(tab, tab_name=tab_name, daily_limit=daily_limit, blocklist=self.blocklist, run_semaphore=self.run_semaphore)
                 worker.pack(fill="both", expand=True)

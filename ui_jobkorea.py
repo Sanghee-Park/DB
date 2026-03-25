@@ -22,6 +22,12 @@ import os
 
 email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
 
+def _interruptible_sleep(stop_event: threading.Event, seconds: float):
+    if stop_event is None:
+        time.sleep(seconds)
+        return False
+    return stop_event.wait(timeout=seconds)
+
 def extract_valid_emails(text):
     if not text: return set()
     emails = re.findall(email_pattern, text)
@@ -47,36 +53,47 @@ def get_chrome_driver():
     return webdriver.Chrome(service=service, options=options)
 
 def run_jobkorea_crawler(search_keyword, max_pages, log_cb, check_running_cb, data_cb,
-                         blocklist: BlockList = None, history_manager: LocalHistoryManager = None):
+                         blocklist: BlockList = None, history_manager: LocalHistoryManager = None,
+                         stop_event: threading.Event = None, run_semaphore: threading.BoundedSemaphore = None):
     driver = None
     blocklist = blocklist or BlockList()
     history_manager = history_manager or LocalHistoryManager()
-    try: driver = get_chrome_driver()
-    except Exception as e:
-        log_cb(f"브라우저 오류: {e}"); log_cb("FINISH_SIGNAL")
-        return
-
-    collected_companies = []
+    acquired = False
     try:
+        if run_semaphore is not None:
+            run_semaphore.acquire()
+            acquired = True
+        try:
+            driver = get_chrome_driver()
+        except Exception as e:
+            log_cb(f"브라우저 오류: {e}"); log_cb("FINISH_SIGNAL")
+            return
+
+        collected_companies = []
         log_cb("🚀 잡코리아 백그라운드 접속 중...")
         driver.get("https://www.jobkorea.co.kr/Review/Home")
         driver.maximize_window()
-        time.sleep(3)
+        if _interruptible_sleep(stop_event, 3):
+            return
         
         try:
             for btn in driver.find_elements(By.XPATH, "//*[contains(text(), '초기화')]"):
                 if btn.is_displayed():
                     driver.execute_script("arguments[0].click();", btn)
-                    time.sleep(1.5); break
+                    if _interruptible_sleep(stop_event, 1.5):
+                        return
+                    break
         except: pass
 
         try:
             keyword_btn = WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.XPATH, f"//*[contains(text(), '{search_keyword}')]")))
             driver.execute_script("arguments[0].click();", keyword_btn)
-            time.sleep(1)
+            if _interruptible_sleep(stop_event, 1):
+                return
             search_btn = driver.find_element(By.XPATH, "//button[contains(text(), '선택된 조건 검색')]")
             driver.execute_script("arguments[0].click();", search_btn)
-            time.sleep(4) 
+            if _interruptible_sleep(stop_event, 4):
+                return
         except Exception:
             log_cb(f"⚠️ '{search_keyword}' 조건을 찾지 못했습니다."); log_cb("FINISH_SIGNAL")
             return
@@ -85,7 +102,8 @@ def run_jobkorea_crawler(search_keyword, max_pages, log_cb, check_running_cb, da
         log_cb("🚀 기업 리스트 수집 시작...")
         while current_page <= max_pages:
             if not check_running_cb(): break
-            time.sleep(2)
+            if _interruptible_sleep(stop_event, 2):
+                break
             
             js_extract = """
             let results = [];
@@ -142,14 +160,16 @@ def run_jobkorea_crawler(search_keyword, max_pages, log_cb, check_running_cb, da
             try:
                 driver.set_page_load_timeout(15)
                 driver.get(review_url)
-                time.sleep(random.uniform(2, 3))
+                if _interruptible_sleep(stop_event, random.uniform(2, 3)):
+                    break
                 
                 try:
                     info_link = driver.find_element(By.XPATH, "//a[contains(text(), '기업 정보 보기') or contains(text(), '기업정보 보기')]")
                     info_url = info_link.get_attribute("href")
                     if info_url and info_url.startswith("http"): driver.get(info_url)
                     else: driver.execute_script("arguments[0].click();", info_link)
-                    time.sleep(random.uniform(2, 3))
+                    if _interruptible_sleep(stop_event, random.uniform(2, 3)):
+                        break
                 except: pass
                 
                 target_homepage = None
@@ -164,7 +184,8 @@ def run_jobkorea_crawler(search_keyword, max_pages, log_cb, check_running_cb, da
                 
                 try:
                     driver.get(target_homepage)
-                    time.sleep(random.uniform(3, 5))
+                    if _interruptible_sleep(stop_event, random.uniform(3, 5)):
+                        break
                     valid_emails = set()
                     footers = driver.find_elements(By.CSS_SELECTOR, "footer, address, .footer, #footer, .bottom")
                     footer_text = " ".join([f.text for f in footers])
@@ -179,7 +200,9 @@ def run_jobkorea_crawler(search_keyword, max_pages, log_cb, check_running_cb, da
                             except: continue
                         for link in list(set(target_links))[:3]:
                             try:
-                                driver.get(link); time.sleep(2)
+                                driver.get(link)
+                                if _interruptible_sleep(stop_event, 2):
+                                    break
                                 valid_emails.update(extract_valid_emails(driver.find_element(By.TAG_NAME, "body").text))
                                 if valid_emails: break
                             except: continue
@@ -210,23 +233,29 @@ def run_jobkorea_crawler(search_keyword, max_pages, log_cb, check_running_cb, da
 
     finally:
         if driver: driver.quit()
+        if acquired and run_semaphore is not None:
+            try:
+                run_semaphore.release()
+            except Exception:
+                pass
         log_cb("FINISH_SIGNAL")
 
 # 🌟 중요: 반드시 파일 맨 아래 위치! 🌟
 class JobKoreaTabUI(ctk.CTkFrame):
-    def __init__(self, master, plan="기간제", blocklist: BlockList = None):
+    def __init__(self, master, plan="기간제", blocklist: BlockList = None, run_semaphore: threading.BoundedSemaphore = None):
         super().__init__(master, fg_color="transparent")
         self.data_list = []
         self.is_running = False
         self.plan = plan
         self.blocklist = blocklist or BlockList()
+        self.run_semaphore = run_semaphore
         self.history_manager = LocalHistoryManager()
         self.keyword_queue = []
         self.reserved_keywords = []
         self.current_keyword = ""
         self.queue_total_collected = 0
-        self.all_results_by_keyword = {}
         self.max_pages = 9999
+        self.stop_event = threading.Event()
         self.save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "autosave")
         
         # 🌟 무료 버전은 잡코리아 화면 자체를 막아버립니다.
@@ -408,7 +437,6 @@ class JobKoreaTabUI(ctk.CTkFrame):
     def reset_crawling(self):
         if self.is_running: return
         self.data_list.clear()
-        self.all_results_by_keyword.clear()
         for item in self.tree.get_children(): self.tree.delete(item)
         self.status_label.configure(text="🧹 테이블이 초기화되었습니다.")
         self.btn_save.configure(state="disabled")
@@ -416,6 +444,7 @@ class JobKoreaTabUI(ctk.CTkFrame):
     def stop_crawling(self):
         if self.is_running:
             self.is_running = False
+            self.stop_event.set()
             self.status_label.configure(text="🛑 수집 중단 요청됨 (작업 정리 중...)")
 
     def start_crawling(self):
@@ -438,9 +467,9 @@ class JobKoreaTabUI(ctk.CTkFrame):
             return
 
         self.is_running = True
+        self.stop_event = threading.Event()
         self.keyword_queue = keywords
         self.queue_total_collected = 0
-        self.all_results_by_keyword = {}
         self.max_pages = max_pages
         self.data_list.clear() 
         for item in self.tree.get_children(): self.tree.delete(item) 
@@ -472,7 +501,6 @@ class JobKoreaTabUI(ctk.CTkFrame):
             return
 
         self.current_keyword = self.keyword_queue.pop(0)
-        self.all_results_by_keyword.setdefault(self.current_keyword, [])
         self.entry_keyword.delete(0, "end")
         self.entry_keyword.insert(0, self.current_keyword)
         self.data_list.clear()
@@ -490,7 +518,6 @@ class JobKoreaTabUI(ctk.CTkFrame):
 
         def data_cb(row_dict):
             self.data_list.append(row_dict)
-            self.all_results_by_keyword.setdefault(self.current_keyword, []).append(row_dict)
             self.queue_total_collected += 1
             idx = len(self.data_list)
             tree_values = (idx, row_dict.get("업체명", ""), row_dict.get("업종", ""), row_dict.get("이메일", ""))
@@ -500,7 +527,7 @@ class JobKoreaTabUI(ctk.CTkFrame):
         threading.Thread(
             target=run_jobkorea_crawler,
             args=(self.current_keyword, self.max_pages, log_cb, lambda: self.is_running, data_cb,
-                  self.blocklist, self.history_manager),
+                  self.blocklist, self.history_manager, self.stop_event, self.run_semaphore),
             daemon=True
         ).start()
 
@@ -537,32 +564,6 @@ class JobKoreaTabUI(ctk.CTkFrame):
             return file_path
         except Exception as e:
             messagebox.showerror("오류", f"자동 저장 실패: {e}")
-            return None
-
-    def _safe_sheet_name(self, raw_name: str):
-        name = (raw_name or "Sheet").strip()
-        invalid = ['\\', '/', '*', '?', ':', '[', ']']
-        for ch in invalid:
-            name = name.replace(ch, "_")
-        if not name:
-            name = "Sheet"
-        return name[:31]
-
-    def save_all_results_auto(self):
-        if not self.all_results_by_keyword:
-            return None
-        try:
-            os.makedirs(self.save_dir, exist_ok=True)
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            file_path = os.path.join(self.save_dir, f"{ts}_JobKorea_ALL.xlsx")
-            with pd.ExcelWriter(file_path, engine="openpyxl") as writer:
-                for keyword, rows in self.all_results_by_keyword.items():
-                    if not rows:
-                        continue
-                    df = pd.DataFrame(rows)[["업체명", "업종", "이메일"]]
-                    df.to_excel(writer, sheet_name=self._safe_sheet_name(keyword), index=False)
-            return file_path
-        except Exception:
             return None
 
     def save_to_excel(self, auto=False, keyword_override=None):
