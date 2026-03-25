@@ -326,8 +326,10 @@ class JobKoreaTabUI(ctk.CTkFrame):
 
         self.btn_save = ctk.CTkButton(bottom_frame, text="💾 엑셀 저장", font=("Arial", 13, "bold"), fg_color="#1976D2", hover_color="#1565C0", width=110, state="disabled", command=self.save_to_excel)
         self.btn_save.pack(side="right", padx=5)
-        self.btn_save_dir = ctk.CTkButton(bottom_frame, text="📁 저장폴더", font=("Arial", 13, "bold"), fg_color="#455A64", hover_color="#37474F", width=100, command=self.choose_save_dir)
+        self.btn_save_dir = ctk.CTkButton(bottom_frame, text="📁 저장폴더 선택", font=("Arial", 13, "bold"), fg_color="#455A64", hover_color="#37474F", width=120, command=self.choose_save_dir)
         self.btn_save_dir.pack(side="right", padx=5)
+        self.btn_import_db = ctk.CTkButton(bottom_frame, text="📂 기존 추출 DB 불러오기", font=("Arial", 13, "bold"), fg_color="#5D4037", hover_color="#4E342E", width=170, command=self.import_existing_db)
+        self.btn_import_db.pack(side="right", padx=5)
         self.btn_reset = ctk.CTkButton(bottom_frame, text="🔄 초기화", font=("Arial", 13, "bold"), fg_color="#757575", hover_color="#616161", width=90, command=self.reset_crawling)
         self.btn_reset.pack(side="right", padx=5)
         self.btn_stop = ctk.CTkButton(bottom_frame, text="🛑 정지", font=("Arial", 13, "bold"), fg_color="#D32F2F", hover_color="#C62828", width=90, command=self.stop_crawling)
@@ -365,6 +367,18 @@ class JobKoreaTabUI(ctk.CTkFrame):
         if selected:
             self.save_dir = selected
             self.status_label.configure(text=f"📁 저장 폴더 설정: {self.save_dir}")
+
+    def import_existing_db(self):
+        if self.is_running:
+            return
+        file_path = filedialog.askopenfilename(title="기존 추출 DB 엑셀 선택", filetypes=[("Excel Files", "*.xlsx;*.xls")])
+        if not file_path:
+            return
+        try:
+            merged = self.history_manager.merge_from_excel(file_path)
+            self.status_label.configure(text=f"📂 기존 DB 병합 완료 (이메일 +{merged['emails']}, 도메인 +{merged['domains']})")
+        except Exception as e:
+            messagebox.showerror("오류", f"기존 DB 병합 실패: {e}")
 
     def add_block_item(self):
         raw = (self.block_entry.get() or "").strip()
@@ -437,16 +451,16 @@ class JobKoreaTabUI(ctk.CTkFrame):
 
     def _run_next_keyword(self):
         if not self.is_running:
+            # 정지 후에도 시작 버튼이 disabled로 남지 않도록 즉시 복구
+            self.btn_start.configure(state="normal", text="🚀 추출 시작")
+            self.keyword_queue = []
+            self.status_label.configure(text="🛑 수집이 중단되었습니다.")
             return
         if not self.keyword_queue:
             self.is_running = False
             self.btn_start.configure(state="normal", text="🚀 추출 시작")
             self.btn_save.configure(state="normal" if self.data_list else "disabled")
-            saved_path = self.save_all_results_auto()
-            if saved_path:
-                self.status_label.configure(text=f"✅ 전체 키워드 완료 + 자동 저장 완료: {os.path.basename(saved_path)}")
-            else:
-                self.status_label.configure(text="✅ 전체 키워드 작업 완료!")
+            self.status_label.configure(text="✅ 전체 키워드 작업 완료!")
             return
 
         # JobKorea는 유료 전용 탭이라 사실상 제한 없음, 그래도 안전하게 동일 규칙 지원
@@ -467,6 +481,9 @@ class JobKoreaTabUI(ctk.CTkFrame):
 
         def log_cb(msg):
             if msg == "FINISH_SIGNAL":
+                if self.data_list:
+                    self.after(0, lambda: self.save_keyword_result_auto(self.current_keyword))
+                    self.after(0, self.clear_current_results)
                 self.after(0, self._run_next_keyword)
             else:
                 self.after(0, lambda: self.status_label.configure(text=msg))
@@ -486,6 +503,41 @@ class JobKoreaTabUI(ctk.CTkFrame):
                   self.blocklist, self.history_manager),
             daemon=True
         ).start()
+
+    def clear_current_results(self):
+        self.data_list.clear()
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+    def _safe_keyword_filename(self, keyword: str):
+        safe = re.sub(r'[\\/:*?"<>|]+', "_", (keyword or "keyword")).strip()
+        safe = safe.replace(" ", "_")
+        return safe or "keyword"
+
+    def _build_keyword_result_path(self, keyword: str):
+        os.makedirs(self.save_dir, exist_ok=True)
+        base_name = f"{self._safe_keyword_filename(keyword)}_결과.xlsx"
+        path = os.path.join(self.save_dir, base_name)
+        if not os.path.exists(path):
+            return path
+        idx = 2
+        while True:
+            candidate = os.path.join(self.save_dir, f"{self._safe_keyword_filename(keyword)}_결과_{idx}.xlsx")
+            if not os.path.exists(candidate):
+                return candidate
+            idx += 1
+
+    def save_keyword_result_auto(self, keyword):
+        if not self.data_list:
+            return None
+        try:
+            file_path = self._build_keyword_result_path(keyword)
+            pd.DataFrame(self.data_list)[["업체명", "업종", "이메일"]].to_excel(file_path, index=False)
+            self.status_label.configure(text=f"💾 자동 저장 완료: {os.path.basename(file_path)}")
+            return file_path
+        except Exception as e:
+            messagebox.showerror("오류", f"자동 저장 실패: {e}")
+            return None
 
     def _safe_sheet_name(self, raw_name: str):
         name = (raw_name or "Sheet").strip()

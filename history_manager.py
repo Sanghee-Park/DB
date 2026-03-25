@@ -1,6 +1,7 @@
 import json
 import os
 import threading
+import re
 
 
 class LocalHistoryManager:
@@ -82,3 +83,61 @@ class LocalHistoryManager:
 
     def add_domain(self, domain: str = ""):
         self.add_record(email="", domain=domain)
+
+    def merge_from_excel(self, file_path: str):
+        """
+        기존 추출 엑셀을 로컬 이력(local_history.json)에 병합합니다.
+        - 이메일 컬럼: 이메일 / email
+        - 도메인 컬럼: 도메인 / domain / 홈페이지 / homepage / url
+        """
+        import pandas as pd
+
+        email_added = 0
+        domain_added = 0
+
+        def norm_domain(v: str):
+            s = (v or "").strip().lower()
+            if not s:
+                return ""
+            s = re.sub(r"^https?://", "", s)
+            s = s.split("/", 1)[0]
+            s = s.replace("www.", "")
+            return s
+
+        xls = pd.ExcelFile(file_path)
+        for sheet_name in xls.sheet_names:
+            df = pd.read_excel(file_path, sheet_name=sheet_name)
+            cols = {str(c).strip().lower(): c for c in df.columns}
+
+            email_col = None
+            for key in ("이메일", "email"):
+                if key.lower() in cols:
+                    email_col = cols[key.lower()]
+                    break
+
+            domain_col = None
+            for key in ("도메인", "domain", "홈페이지", "homepage", "url"):
+                if key.lower() in cols:
+                    domain_col = cols[key.lower()]
+                    break
+
+            if email_col is not None:
+                for val in df[email_col].tolist():
+                    s = str(val).strip()
+                    if not s or s.lower() in ("nan", "none"):
+                        continue
+                    for e in [x.strip().lower() for x in s.split(",") if x.strip()]:
+                        if not self.is_email_duplicate(e):
+                            self.add_email(e)
+                            email_added += 1
+
+            if domain_col is not None:
+                for val in df[domain_col].tolist():
+                    d = norm_domain(str(val))
+                    if not d or d in ("nan", "none"):
+                        continue
+                    if not self.is_domain_duplicate(d):
+                        self.add_domain(d)
+                        domain_added += 1
+
+        return {"emails": email_added, "domains": domain_added}
